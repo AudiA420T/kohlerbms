@@ -14,4 +14,5 @@ Other Parts Needed:
 4. Some other wires to wire into the harness
 
 Diagram for ESP32 + CAN Module:
+
 <img width="577" alt="image" src="https://github.com/user-attachments/assets/907820a6-b7c4-4990-8313-9f1ff39146a4" />
