@@ -15,4 +15,5 @@ Other Parts Needed:
 
 Diagram for ESP32 + CAN Module:
 
-<img width="577" alt="image" src="https://github.com/user-attachments/assets/907820a6-b7c4-4990-8313-9f1ff39146a4" />
+<img width="996" alt="image" src="https://github.com/user-attachments/assets/589510f6-e327-4189-9ccb-9dd507b2ca53" />
+
