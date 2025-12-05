@@ -30,6 +30,9 @@ const char* password = "RipVanWinkle";
 #define CHARGE_ENABLE_PIN GPIO_NUM_19     // Optional direct control
 #define DISCHARGE_ENABLE_PIN GPIO_NUM_23  // Optional direct control
 
+// Status LED pin (built-in blue LED on most ESP32 boards)
+#define STATUS_LED_PIN GPIO_NUM_2
+
 // Growatt Protocol Constants
 #define GROWATT_SLAVE_ADDR 0x01
 #define GROWATT_BAUD_RATE 9600
@@ -119,6 +122,18 @@ struct InverterControl {
   String lastAction = "Bridge Started";
   String balanceStatus = "Unknown";
 } inverterControl;
+
+// Connectivity monitoring structure
+struct ConnectivityStatus {
+  bool wifiConnected = false;
+  bool internetConnected = false;
+  bool webServerResponding = false;
+  unsigned long lastConnectivityCheck = 0;
+  unsigned long lastResetAttempt = 0;
+  int consecutiveFailures = 0;
+  unsigned long ledLastToggle = 0;
+  bool ledState = false;
+} connectivityStatus;
 
 // Enhanced message tracking structures
 struct SimpleUnknownMessage {
@@ -546,6 +561,105 @@ float getMinCellVoltage() {
     }
   }
   return minV;
+}
+
+// LED control functions
+void setStatusLED(bool state) {
+  digitalWrite(STATUS_LED_PIN, state);
+  connectivityStatus.ledState = state;
+}
+
+void blinkStatusLED() {
+  if (millis() - connectivityStatus.ledLastToggle > 500) {
+    connectivityStatus.ledState = !connectivityStatus.ledState;
+    digitalWrite(STATUS_LED_PIN, connectivityStatus.ledState);
+    connectivityStatus.ledLastToggle = millis();
+  }
+}
+
+// Connectivity check functions
+bool checkInternetConnectivity() {
+  // Simple internet connectivity check using Google DNS
+  WiFiClient client;
+  if (client.connect("8.8.8.8", 53)) {
+    client.stop();
+    return true;
+  }
+  return false;
+}
+
+bool checkWebServerHealth() {
+  // Check if our web server is responding by trying to connect to our own IP
+  WiFiClient client;
+  if (WiFi.status() == WL_CONNECTED) {
+    String localIP = WiFi.localIP().toString();
+    if (client.connect(localIP.c_str(), 80)) {
+      client.stop();
+      return true;
+    }
+  }
+  return false;
+}
+
+void performConnectivityCheck() {
+  // Only check every 30 seconds to avoid excessive network traffic
+  if (millis() - connectivityStatus.lastConnectivityCheck < 30000) {
+    return;
+  }
+  
+  connectivityStatus.lastConnectivityCheck = millis();
+  
+  // Check WiFi connection
+  connectivityStatus.wifiConnected = (WiFi.status() == WL_CONNECTED);
+  
+  if (connectivityStatus.wifiConnected) {
+    // Check internet connectivity
+    connectivityStatus.internetConnected = checkInternetConnectivity();
+    
+    // Check web server health
+    connectivityStatus.webServerResponding = checkWebServerHealth();
+    
+    // Update LED status based on connectivity
+    if (connectivityStatus.internetConnected && connectivityStatus.webServerResponding) {
+      // All good - solid blue LED
+      setStatusLED(true);
+      connectivityStatus.consecutiveFailures = 0;
+      Serial.println("[CONNECTIVITY] All systems operational - LED ON");
+    } else {
+      // Partial connectivity - blink LED
+      blinkStatusLED();
+      connectivityStatus.consecutiveFailures++;
+      Serial.printf("[CONNECTIVITY] Partial connectivity (failures: %d) - LED BLINKING\n", 
+                    connectivityStatus.consecutiveFailures);
+    }
+  } else {
+    // No WiFi - LED off, attempt reset if needed
+    setStatusLED(false);
+    connectivityStatus.internetConnected = false;
+    connectivityStatus.webServerResponding = false;
+    connectivityStatus.consecutiveFailures++;
+    
+    Serial.printf("[CONNECTIVITY] WiFi disconnected (failures: %d) - LED OFF\n", 
+                  connectivityStatus.consecutiveFailures);
+    
+    // Attempt ESP32 reset if we've had too many consecutive failures
+    if (connectivityStatus.consecutiveFailures >= 3 && 
+        millis() - connectivityStatus.lastResetAttempt > 300000) { // 5 minutes between resets
+      
+      Serial.println("[CONNECTIVITY] Too many failures, resetting ESP32...");
+      connectivityStatus.lastResetAttempt = millis();
+      
+      // Blink LED rapidly before reset to indicate restart
+      for (int i = 0; i < 10; i++) {
+        digitalWrite(STATUS_LED_PIN, HIGH);
+        delay(100);
+        digitalWrite(STATUS_LED_PIN, LOW);
+        delay(100);
+      }
+      
+      ESP.restart();
+    }
+  }
 }
 
 void handleGrowattRequests() {
@@ -1481,8 +1595,13 @@ void setup() {
   memset(&catlData, 0, sizeof(catlData));
   memset(&masterRequest, 0, sizeof(masterRequest));
   memset(&growattResponse, 0, sizeof(growattResponse));
+  memset(&connectivityStatus, 0, sizeof(connectivityStatus));
   memset(unknownMessages, 0, sizeof(unknownMessages));
   memset(knownMessages, 0, sizeof(knownMessages));
+  
+  // Initialize status LED pin
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW); // Start with LED off
   
   // Initialize optional control pins (only if they are defined and not 0)
   if (CHARGE_ENABLE_PIN != 0) {
@@ -1496,6 +1615,13 @@ void setup() {
   
   Serial.println("=== CATL-to-Growatt BMS Bridge ===");
   Serial.println("[INIT] ESP32 CAN <-> RS485 Protocol Bridge with Progressive Loading");
+  Serial.println("[INIT] Enhanced with connectivity monitoring and auto-reset functionality");
+  
+  Serial.printf("[INIT] Status LED initialized on pin %d\n", STATUS_LED_PIN);
+  Serial.println("[INIT] LED Status Indicators:");
+  Serial.println("   - Solid ON: WiFi + Internet + WebServer all working");
+  Serial.println("   - Blinking: Partial connectivity issues");
+  Serial.println("   - OFF: WiFi disconnected, will auto-reset after 3 failures");
   
   if (CHARGE_ENABLE_PIN != 0 || DISCHARGE_ENABLE_PIN != 0) {
     Serial.println("[INIT] Optional inverter control pins initialized");
@@ -1534,6 +1660,9 @@ void loop() {
   // Update inverter control based on safety conditions
   updateInverterControl();
   
+  // Perform connectivity monitoring and LED status updates
+  performConnectivityCheck();
+  
   // Send updates to web dashboard every 1 second
   static unsigned long lastUpdate = 0;
   if (millis() - lastUpdate > 1000) {
@@ -1547,12 +1676,15 @@ void loop() {
   // Print bridge status every 30 seconds
   static unsigned long lastStatus = 0;
   if (millis() - lastStatus > 30000) {
-    Serial.printf("[STATUS] Bridge Status: CATL=%s, Growatt=%d reqs, SOC=%d%%, Pack=%.1fV, Balance=%s, Free Heap=%d\n",
+    Serial.printf("[STATUS] Bridge Status: CATL=%s, Growatt=%d reqs, SOC=%d%%, Pack=%.1fV, Balance=%s, WiFi=%s, Internet=%s, WebServer=%s, Free Heap=%d\n",
                   (millis() - catlData.lastUpdate < 5000) ? "OK" : "TIMEOUT",
                   growattResponse.growattRequestCount,
                   catlData.soc,
                   catlData.packVoltage,
                   inverterControl.balancingActive ? "ACTIVE" : "INACTIVE",
+                  connectivityStatus.wifiConnected ? "OK" : "FAIL",
+                  connectivityStatus.internetConnected ? "OK" : "FAIL",
+                  connectivityStatus.webServerResponding ? "OK" : "FAIL",
                   ESP.getFreeHeap());
     lastStatus = millis();
   }
