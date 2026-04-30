@@ -83,6 +83,13 @@ The project includes all required libraries in the `libraries/` folder:
 
 ## Configuration
 
+### Battery Configuration
+This bridge is configured for a **2S2P CATL battery system**:
+- **2S**: 2 modules in series (each module ~22.4-28.8V)
+- **2P**: 2 parallel strings for increased capacity
+- **Pack Voltage Range**: 44.8V - 57.6V (module voltage × 2)
+- **SOC Calculation**: Linear interpolation based on pack voltage range
+
 ### Safety Limits
 Located in `BMSReaderS3.ino` - modify as needed for your battery chemistry:
 
@@ -91,8 +98,8 @@ struct SafetyLimits {
   float maxCellVoltage = 3.60;      // V - charge reduction threshold
   float hardStopVoltage = 3.65;     // V - emergency stop
   float minCellVoltage = 3.00;      // V - discharge cutoff
-  float maxPackVoltage = 29.0;      // V - pack level limits
-  float minPackVoltage = 24.0;      // V
+  float maxPackVoltage = 57.6;      // V - 2S2P pack level limits (28.8V x 2)
+  float minPackVoltage = 44.8;      // V - 2S2P pack level limits (22.4V x 2)
 } safetyLimits;
 ```
 
