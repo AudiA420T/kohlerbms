@@ -16,7 +16,7 @@
 #include <ACAN_ESP32.h>
 
 // WiFi credentials
-const char* ssid = "NETWORK";
+const char* ssid = "WIFI";
 const char* password = "PASSWORD";
 
 // Hardware pin definitions for ESP32-S3 with ACAN_ESP32
@@ -178,6 +178,12 @@ const int daylightOffset_sec = 0;
 // Web server and WebSocket
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+AsyncWebSocket serialWs("/serialws");
+
+// Serial console buffer for remote viewing
+String serialBuffer = "";
+const int MAX_SERIAL_BUFFER = 8192;
+unsigned long lastSerialBroadcast = 0;
 
 // Preferences for persistent storage
 Preferences preferences;
@@ -202,6 +208,9 @@ String getJavaScript();
 String getCSS();
 void broadcastToWebSocket(String data);
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len);
+void onSerialWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len);
+void captureSerialOutput(String message);
+String getSerialHTML();
 
 // Growatt RS485 functions
 void updateGrowattResponse();
@@ -258,6 +267,9 @@ void trackKnownMessage(uint32_t id, const char* description, can_message_t& msg)
     strncpy(knownMessages[knownCount].description, description, 63);
     knownMessages[knownCount].description[63] = '\0';
     knownCount++;
+    String knownMsg = "[KNOWN] New message type: 0x" + String(id, HEX) + " - " + String(description) + ", knownCount=" + String(knownCount);
+    Serial.println(knownMsg);
+    captureSerialOutput(knownMsg);
   }
 }
 
@@ -394,7 +406,9 @@ void setupCAN() {
   const uint32_t errorCode = ACAN_ESP32::can.begin(settings);
 
   if (0 == errorCode) {
-    Serial.println("[OK] CAN started for CATL communication on pins 15/16");
+    String canMsg = "[OK] CAN started for CATL communication on pins 15/16";
+    Serial.println(canMsg);
+    captureSerialOutput(canMsg);
     // Purple LED to indicate CAN is ready
     strip.setPixelColor(0, strip.Color(128, 0, 128));
     strip.show();
@@ -486,6 +500,33 @@ void loop() {
       }
       Serial.println();
       lastCanDebug = millis();
+    }
+
+    // Debug: Log all unique message IDs every 5 seconds
+    static unsigned long lastIdDebug = 0;
+    static uint32_t lastIds[10];
+    static int idCount = 0;
+    if (millis() - lastIdDebug > 5000) {
+      bool found = false;
+      for (int i = 0; i < idCount; i++) {
+        if (lastIds[i] == rx_message.id) {
+          found = true;
+          break;
+        }
+      }
+      if (!found && idCount < 10) {
+        lastIds[idCount++] = rx_message.id;
+      }
+      if (millis() - lastIdDebug > 5000) {
+        String idsMsg = "[CAN] Recent unique IDs: ";
+        for (int i = 0; i < idCount; i++) {
+          idsMsg += "0x" + String(lastIds[i], HEX) + " ";
+        }
+        Serial.println(idsMsg);
+        captureSerialOutput(idsMsg);
+        idCount = 0; // Reset for next cycle
+        lastIdDebug = millis();
+      }
     }
   }
 
@@ -618,13 +659,61 @@ void processCATLMessage(can_message_t& msg) {
     masterRequest.lastSeen = millis();
     masterRequest.count++;
 
-    // Decode current measurement (byte 7)
+    // Try multiple current decoding approaches
     uint8_t currentRaw = data[7];
-    masterRequest.currentAmps = currentRaw * 2.0;  // Based on analysis
+
+    // Try different bytes and methods
+    int16_t currentSigned7 = (int8_t)data[7];  // Signed byte 7
+    int16_t current16bit = (data[7] << 8) | data[6];  // 16-bit from bytes 6-7
+    int16_t currentSigned16 = (int16_t)current16bit;  // Signed 16-bit
+
+    // For now, keep original method but try alternatives if zero
+    masterRequest.currentAmps = currentRaw * 2.0;
+    if (currentRaw == 0) {
+      // Try other approaches
+      if (abs(currentSigned7) > 0 && abs(currentSigned7) < 100) {
+        masterRequest.currentAmps = currentSigned7 * 0.1;  // Different scale
+      } else if (abs(currentSigned16) > 0 && abs(currentSigned16) < 10000) {
+        masterRequest.currentAmps = currentSigned16 * 0.01;  // 16-bit with centamps
+      }
+    }
     catlData.systemCurrent = masterRequest.currentAmps;
 
     // Calculate power
     masterRequest.powerWatts = masterRequest.currentAmps * catlData.packVoltage;
+
+    // Debug current calculation with full data
+    String debugMsg = "[DEBUG] Master request: rawU8=" + String(currentRaw) + ", rawS8=" + String(currentSigned7) +
+                      ", raw16=" + String(current16bit) + ", rawS16=" + String(currentSigned16) +
+                      ", finalAmps=" + String(masterRequest.currentAmps, 3) + ", packV=" + String(catlData.packVoltage, 2) +
+                      ", power=" + String(masterRequest.powerWatts, 2);
+    String fullData = "[DEBUG] Full data: ";
+    for (int i = 0; i < 8; i++) {
+      fullData += "b" + String(i) + "=" + String(data[i], HEX) + "(" + String(data[i]) + ") ";
+    }
+    Serial.println(debugMsg);
+    captureSerialOutput(debugMsg);
+    Serial.println(fullData);
+    captureSerialOutput(fullData);
+  }
+
+  // Look for potential current messages in other IDs
+  else if ((id & 0xFFFFFF00) == 0x18002100 || (id & 0xFFFFFF00) == 0x18002200 ||
+           (id & 0xFFFFFF00) == 0x18002300 || (id & 0xFFFFFF00) == 0x18002400) {
+    isKnownMessage = true;
+    trackKnownMessage(id, "Potential Current/Power Data", msg);
+
+    // Try to extract current from different positions
+    int16_t possibleCurrent1 = (data[1] << 8) | data[0];  // Little endian 16-bit
+    int16_t possibleCurrent2 = (data[0] << 8) | data[1];  // Big endian 16-bit
+    int16_t possibleCurrent3 = (data[3] << 8) | data[2];  // Bytes 2-3
+    int16_t possibleCurrent4 = (data[2] << 8) | data[3];  // Bytes 2-3 reversed
+
+    // Debug potential current values
+    String currentTest = "[CURRENT-TEST] ID=0x" + String(id, HEX) + " pos1=" + String(possibleCurrent1) +
+                        " pos2=" + String(possibleCurrent2) + " pos3=" + String(possibleCurrent3) + " pos4=" + String(possibleCurrent4);
+    Serial.println(currentTest);
+    captureSerialOutput(currentTest);
   }
 
   // Track initialization sequence (0x1C04xxxx)
@@ -640,9 +729,43 @@ void processCATLMessage(can_message_t& msg) {
     }
   }
 
+  // Check for potential current data in any message
+  static unsigned long lastCurrentScan = 0;
+  if (millis() - lastCurrentScan > 3000) {
+    // Look for non-zero bytes that might be current in any message
+    bool hasNonZero = false;
+    for (int i = 0; i < msg.len; i++) {
+      if (data[i] != 0x00 && data[i] != 0xFF) {
+        hasNonZero = true;
+        break;
+      }
+    }
+    if (hasNonZero) {
+      String currentScan = "[CURRENT-SCAN] ID=0x" + String(id, HEX) + " data=";
+      for (int i = 0; i < msg.len; i++) {
+        currentScan += String(data[i], HEX) + " ";
+      }
+      Serial.println(currentScan);
+      captureSerialOutput(currentScan);
+    }
+    lastCurrentScan = millis();
+  }
+
   // If unknown, log it
   if (!isKnownMessage) {
     logUnknownMessage(msg);
+    // Debug unknown messages
+    static unsigned long lastUnknownDebug = 0;
+    if (millis() - lastUnknownDebug > 5000) {
+      String unknownMsg = "[DEBUG] Unknown message: ID=0x" + String(id, HEX) + ", len=" + String(msg.len) + ", data=";
+      for (int i = 0; i < msg.len; i++) {
+        unknownMsg += String(data[i], HEX) + " ";
+      }
+      unknownMsg += ", unknownCount=" + String(unknownCount);
+      Serial.println(unknownMsg);
+      captureSerialOutput(unknownMsg);
+      lastUnknownDebug = millis();
+    }
   }
 
   // Calculate derived values
@@ -712,8 +835,8 @@ void calculatePackStats() {
   catlData.minTemp = minTemp;
 
   // Calculate SOC based on pack voltage for 2S2P configuration
-  float minPackV = 24.0;   // 16 cells * 1.5V (conservative low)
-  float maxPackV = 28.8;   // 16 cells * 1.8V (conservative high)
+  float minPackV = 44.8;   // 2S2P pack minimum voltage (22.4V x 2)
+  float maxPackV = 57.6;   // 2S2P pack maximum voltage (28.8V x 2)
   float currentV = catlData.packVoltage;
 
   if (currentV <= minPackV) {
@@ -1012,7 +1135,7 @@ void recordVoltage() {
   static unsigned long lastRecord = 0;
 
   if (millis() - lastRecord > 60000) {  // Record every minute
-    if (catlData.packVoltage >= 20.0) {  // Reasonable minimum for 2S2P
+    if (catlData.packVoltage >= 44.0) {  // Reasonable minimum for 2S2P configuration
       voltageHistory.addEntry(catlData.packVoltage);
       saveVoltageHistory();
       lastRecord = millis();
@@ -1070,7 +1193,22 @@ String getBMSDataJSON() {
   json["unknownMessages"] = unknownCount;
   json["masterMessages"] = masterRequest.count;
   json["balancing"] = catlData.balancingActive;
-  json["power"] = catlData.packVoltage * catlData.systemCurrent;
+  json["systemPower"] = masterRequest.powerWatts;
+  json["systemCurrent"] = catlData.systemCurrent;
+  json["power"] = masterRequest.powerWatts;  // Keep both for compatibility
+  json["current"] = catlData.systemCurrent;
+
+  // Debug output every 10 seconds
+  static unsigned long lastDebugOutput = 0;
+  if (millis() - lastDebugOutput > 10000) {
+    String bmsDebug = "[DEBUG] BMS Data: voltage=" + String(catlData.packVoltage, 2) + "V, current=" + String(catlData.systemCurrent, 2) +
+                      "A, power=" + String(masterRequest.powerWatts, 2) + "W, soc=" + String(catlData.soc) +
+                      "%, connected=" + ((millis() - catlData.lastUpdate < 5000) ? "true" : "false") +
+                      ", knownMsgs=" + String(knownCount) + ", unknownMsgs=" + String(unknownCount);
+    Serial.println(bmsDebug);
+    captureSerialOutput(bmsDebug);
+    lastDebugOutput = millis();
+  }
 
   String response;
   serializeJson(json, response);
@@ -1102,6 +1240,43 @@ void broadcastToWebSocket(String data) {
   ws.textAll(data);
 }
 
+// Serial WebSocket event handler
+void onSerialWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+                           AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("[SERIAL-WS] Serial WebSocket client connected: %u from IP %s\n", client->id(), client->remoteIP().toString().c_str());
+    // Send existing buffer to new client
+    if (serialBuffer.length() > 0) {
+      client->text(serialBuffer);
+    }
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("[SERIAL-WS] Serial WebSocket client disconnected: %u\n", client->id());
+  }
+}
+
+// Capture serial output for remote viewing
+void captureSerialOutput(String message) {
+  serialBuffer += message + "\n";
+
+  // Trim buffer if it gets too large
+  if (serialBuffer.length() > MAX_SERIAL_BUFFER) {
+    int cutPoint = serialBuffer.indexOf('\n', serialBuffer.length() - (MAX_SERIAL_BUFFER * 0.8));
+    if (cutPoint > 0) {
+      serialBuffer = serialBuffer.substring(cutPoint + 1);
+    } else {
+      serialBuffer = serialBuffer.substring(serialBuffer.length() - (MAX_SERIAL_BUFFER * 0.8));
+    }
+  }
+
+  // Broadcast to serial WebSocket clients every 500ms to avoid flooding
+  if (millis() - lastSerialBroadcast > 500) {
+    if (serialWs.count() > 0) {
+      serialWs.textAll(message);
+    }
+    lastSerialBroadcast = millis();
+  }
+}
+
 void setupWebServer() {
   // Ensure network is properly initialized
   if (WiFi.status() != WL_CONNECTED) {
@@ -1113,9 +1288,19 @@ void setupWebServer() {
   ws.onEvent(onWebSocketEvent);
   server.addHandler(&ws);
 
+  // Handle Serial WebSocket connections
+  serialWs.onEvent(onSerialWebSocketEvent);
+  server.addHandler(&serialWs);
+
   // Main dashboard (minimal HTML)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     String html = getBasicHTML();
+    request->send(200, "text/html", html);
+  });
+
+  // Serial console page
+  server.on("/serial", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = getSerialHTML();
     request->send(200, "text/html", html);
   });
 
@@ -1173,7 +1358,8 @@ String getBasicHTML() {
   html += "<button class='clear-button' onclick='clearAllData()'>Clear Data</button>";
 
   html += "<div class='header'><h1>&#128279; CATL-to-Growatt BMS Bridge</h1>";
-  html += "<p>ESP32 Bridge: CAN &#8596; RS485 Protocol Translation with Enhanced Control</p></div>";
+  html += "<p>ESP32 Bridge: CAN &#8596; RS485 Protocol Translation with Enhanced Control</p>";
+  html += "<p><a href='/serial' style='color: #ecf0f1; text-decoration: none; background: rgba(255,255,255,0.2); padding: 5px 10px; border-radius: 3px;'>[CONSOLE] Serial Monitor</a></p></div>";
 
   html += "<div class='loading-indicator' id='loading'>Loading dashboard components...</div>";
 
@@ -1205,6 +1391,79 @@ String getBasicHTML() {
 
   html += "<script src='/script.js?v=7'></script>";
   html += "</body></html>";
+
+  return html;
+}
+
+String getSerialHTML() {
+  String html;
+  html.reserve(2048);
+  html = "<!DOCTYPE html><html><head><title>Serial Console - CATL BMS Bridge</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body { font-family: 'Courier New', monospace; margin: 0; padding: 20px; background: #1a1a1a; color: #00ff00; }";
+  html += ".header { background: #2c3e50; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center; }";
+  html += ".console-container { background: #000; border: 1px solid #333; border-radius: 8px; height: 70vh; overflow-y: auto; padding: 10px; }";
+  html += ".console-output { white-space: pre-wrap; word-wrap: break-word; }";
+  html += ".controls { margin-bottom: 15px; text-align: center; }";
+  html += "button { background: #3498db; color: white; border: none; padding: 8px 15px; border-radius: 4px; margin: 5px; cursor: pointer; }";
+  html += "button:hover { background: #2980b9; }";
+  html += ".status { padding: 10px; background: #34495e; color: white; border-radius: 4px; margin-bottom: 15px; text-align: center; }";
+  html += ".timestamp { color: #888; }";
+  html += "</style></head><body>";
+
+  html += "<div class='header'><h1>[CONSOLE] Serial Monitor</h1><p>Real-time ESP32 Serial Output</p></div>";
+
+  html += "<div class='status' id='status'>Connecting to serial stream...</div>";
+
+  html += "<div class='controls'>";
+  html += "<button onclick='clearConsole()'>Clear Console</button>";
+  html += "<button onclick='scrollToBottom()'>Scroll to Bottom</button>";
+  html += "<button onclick='toggleAutoScroll()' id='autoscroll-btn'>Auto-scroll: ON</button>";
+  html += "<a href='/' style='text-decoration: none;'><button>Back to Dashboard</button></a>";
+  html += "</div>";
+
+  html += "<div class='console-container' id='console'>";
+  html += "<div class='console-output' id='output'></div>";
+  html += "</div>";
+
+  html += "<script>";
+  html += "let autoScroll = true;";
+  html += "let ws;";
+  html += "let reconnectInterval;";
+  html += "function connectWebSocket() {";
+  html += "  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';";
+  html += "  ws = new WebSocket(protocol + '://' + window.location.host + '/serialws');";
+  html += "  ws.onopen = function() {";
+  html += "    document.getElementById('status').innerHTML = '✅ Connected to serial stream';";
+  html += "    document.getElementById('status').style.background = '#27ae60';";
+  html += "    if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }";
+  html += "  };";
+  html += "  ws.onmessage = function(event) {";
+  html += "    const output = document.getElementById('output');";
+  html += "    const timestamp = new Date().toLocaleTimeString();";
+  html += "    output.innerHTML += '<span class=\"timestamp\">[' + timestamp + ']</span> ' + event.data + '\\n';";
+  html += "    if (autoScroll) scrollToBottom();";
+  html += "  };";
+  html += "  ws.onclose = function() {";
+  html += "    document.getElementById('status').innerHTML = '⚠️ Disconnected - Attempting to reconnect...';";
+  html += "    document.getElementById('status').style.background = '#e74c3c';";
+  html += "    if (!reconnectInterval) {";
+  html += "      reconnectInterval = setInterval(connectWebSocket, 3000);";
+  html += "    }";
+  html += "  };";
+  html += "  ws.onerror = function(error) {";
+  html += "    console.error('WebSocket error:', error);";
+  html += "  };";
+  html += "}";
+  html += "function clearConsole() { document.getElementById('output').innerHTML = ''; }";
+  html += "function scrollToBottom() { document.getElementById('console').scrollTop = document.getElementById('console').scrollHeight; }";
+  html += "function toggleAutoScroll() {";
+  html += "  autoScroll = !autoScroll;";
+  html += "  document.getElementById('autoscroll-btn').textContent = 'Auto-scroll: ' + (autoScroll ? 'ON' : 'OFF');";
+  html += "}";
+  html += "connectWebSocket();";
+  html += "</script></body></html>";
 
   return html;
 }
@@ -1268,6 +1527,7 @@ String getJavaScript() {
 
   js = "console.log('CATL Dashboard JS loaded!');";
   js += "var ws; var reconnectTimer; var loadingSteps = 0; var totalSteps = 5; var voltageData = [];";
+  js += "var startTime = Date.now();";
 
   js += "function updateLoadingProgress() {";
   js += "loadingSteps++; console.log('Loading progress:', loadingSteps, '/', totalSteps);";
@@ -1357,11 +1617,13 @@ String getJavaScript() {
   js += "}";
   js += "var moduleNames = ['AA', 'AB', 'AC', 'AD'];";
   js += "var balanceTemp = module.balanceTemp || 0;";
-  js += "var balanceTempHtml = balanceTemp > 0 ? '<div class=\"balance-temp\">Balance: ' + balanceTemp.toFixed(1) + '&deg;C</div>' : '';";
+  js += "var balanceTempF = (balanceTemp * 9/5) + 32;";
+  js += "var balanceTempHtml = balanceTemp > 0 ? '<div class=\"balance-temp\">Balance: ' + balanceTempF.toFixed(1) + '&deg;F</div>' : '';";
   js += "var moduleHeader = '<div class=\"module-header\">Module ' + (index + 1) + ' (' + moduleNames[index] + ')<div class=\"status-dot ' + (module.connected ? 'connected' : '') + '\"></div></div>';";
   js += "var moduleVoltage = '<div class=\"module-voltage\">' + (module.voltage || 0).toFixed(3) + 'V</div>';";
   js += "var moduleCells = '<div class=\"cells\">' + cellsHtml + '</div>';";
-  js += "var moduleTemps = '<div class=\"temps\">Temps: ' + module.temp1.toFixed(1) + '&deg;C, ' + module.temp2.toFixed(1) + '&deg;C</div>';";
+  js += "var temp1F = (module.temp1 * 9/5) + 32; var temp2F = (module.temp2 * 9/5) + 32;";
+  js += "var moduleTemps = '<div class=\"temps\">Temps: ' + temp1F.toFixed(1) + '&deg;F, ' + temp2F.toFixed(1) + '&deg;F</div>';";
   js += "moduleDiv.innerHTML = moduleHeader + moduleVoltage + balanceTempHtml + moduleCells + moduleTemps;";
   js += "modulesDiv.appendChild(moduleDiv); }); }";
   js += "}";
@@ -1372,8 +1634,15 @@ String getJavaScript() {
   js += "unknownHtml += '<table class=\"message-table\"><thead><tr>';";
   js += "unknownHtml += '<th>CAN ID</th><th>Count</th><th>Length</th><th>Data (Hex)</th><th>Potential Description</th><th>Last Seen</th>';";
   js += "unknownHtml += '</tr></thead><tbody>';";
-  js += "if (data.unknownCount > 0) {";
-  js += "unknownHtml += '<tr><td colspan=\"6\">Found ' + data.unknownCount + ' unknown message types</td></tr>';";
+  js += "if (data.unknownMessages && data.unknownMessages.length > 0) {";
+  js += "var sortedUnknown = data.unknownMessages.sort(function(a, b) { var descA = a.potentialDescription || 'ZZZ_Unknown Pattern'; var descB = b.potentialDescription || 'ZZZ_Unknown Pattern'; if (descA !== descB) return descA.localeCompare(descB); return parseInt(a.id, 16) - parseInt(b.id, 16); });";
+  js += "unknownHtml += sortedUnknown.map(function(msg) {";
+  js += "var dataHex = (msg.data || []).map(function(b) { return b.toString(16).padStart(2, '0').toUpperCase(); }).join(' ');";
+  js += "var timeSince = 0;";
+  js += "if (msg.lastSeen > 0) { timeSince = Math.floor((Date.now() - startTime - (msg.lastSeen || 0)) / 1000); if (timeSince < 0) timeSince = 0; }";
+  js += "var timeText = 'Just now'; if (timeSince >= 5) { if (timeSince < 60) timeText = timeSince + 's ago'; else if (timeSince < 3600) timeText = Math.floor(timeSince/60) + 'm ago'; else timeText = Math.floor(timeSince/3600) + 'h ago'; }";
+  js += "return '<tr><td>0x' + (msg.id || '').toString(16).toUpperCase() + '</td><td>' + (msg.count || 0) + '</td><td>' + (msg.length || 0) + '</td><td class=\"data-hex\">' + dataHex + '</td><td>' + (msg.potentialDescription || 'Unknown Pattern') + '</td><td>' + timeText + '</td></tr>';";
+  js += "}).join('');";
   js += "} else { unknownHtml += '<tr><td colspan=\"6\">No unknown messages detected</td></tr>'; }";
   js += "unknownHtml += '</tbody></table>';";
   js += "document.getElementById('unknown-messages').innerHTML = unknownHtml;";
@@ -1382,9 +1651,16 @@ String getJavaScript() {
   js += "knownHtml += '<table class=\"message-table\"><thead><tr>';";
   js += "knownHtml += '<th>CAN ID</th><th>Description</th><th>Count</th><th>Length</th><th>Data (Hex)</th><th>Last Seen</th>';";
   js += "knownHtml += '</tr></thead><tbody>';";
-  js += "if (data.known && data.known.length > 0) {";
-  js += "data.known.forEach(function(msg) { knownHtml += '<tr><td>0x' + msg.id + '</td><td>' + msg.desc + '</td><td>' + msg.count + '</td><td>8</td><td class=\"data-hex\">Live Data</td><td>Active</td></tr>'; });";
-  js += "} else { knownHtml += '<tr><td colspan=\"6\">No known messages yet</td></tr>'; }";
+  js += "if (data.knownMessages && data.knownMessages.length > 0) {";
+  js += "var sortedKnown = data.knownMessages.sort(function(a, b) { return parseInt(a.id, 16) - parseInt(b.id, 16); });";
+  js += "knownHtml += sortedKnown.map(function(msg) {";
+  js += "var timeSince = 0;";
+  js += "if (msg.lastSeen > 0) { timeSince = Math.floor((Date.now() - startTime - (msg.lastSeen || 0)) / 1000); if (timeSince < 0) timeSince = 0; }";
+  js += "var timeText = 'Just now'; if (timeSince >= 5) { if (timeSince < 60) timeText = timeSince + 's ago'; else if (timeSince < 3600) timeText = Math.floor(timeSince/60) + 'm ago'; else timeText = Math.floor(timeSince/3600) + 'h ago'; }";
+  js += "var dataHex = (msg.data || []).map(function(b) { return b.toString(16).padStart(2, '0').toUpperCase(); }).join(' ');";
+  js += "return '<tr><td>0x' + (msg.id || '').toString(16).toUpperCase() + '</td><td>' + (msg.description || 'Unknown') + '</td><td>' + (msg.count || 0) + '</td><td>' + (msg.length || 0) + '</td><td class=\"data-hex\">' + dataHex + '</td><td>' + timeText + '</td></tr>';";
+  js += "}).join('');";
+  js += "} else { knownHtml += '<tr><td colspan=\"6\">No known messages tracked yet</td></tr>'; }";
   js += "knownHtml += '</tbody></table>';";
   js += "document.getElementById('known-messages').innerHTML = knownHtml;";
   js += "}";
@@ -1545,14 +1821,14 @@ String getJavaScript() {
   js += "if (data.voltage !== undefined && document.getElementById('pack-voltage')) document.getElementById('pack-voltage').textContent = data.voltage.toFixed(2) + 'V';";
   js += "if (data.soc !== undefined && document.getElementById('soc')) document.getElementById('soc').textContent = data.soc + '%';";
   js += "if (data.cellSpread !== undefined && document.getElementById('cell-spread')) document.getElementById('cell-spread').textContent = data.cellSpread.toFixed(0) + 'mV';";
-  js += "if (data.minTemp !== undefined && data.maxTemp !== undefined && document.getElementById('temp-range')) document.getElementById('temp-range').innerHTML = data.minTemp.toFixed(1) + '-' + data.maxTemp.toFixed(1) + '&deg;C';";
-  js += "if (data.current !== undefined && document.getElementById('system-current')) document.getElementById('system-current').textContent = data.current.toFixed(2) + 'A';";
-  js += "if (data.power !== undefined && document.getElementById('system-power')) document.getElementById('system-power').textContent = data.power.toFixed(0) + 'W';";
+  js += "if (data.minTemp !== undefined && data.maxTemp !== undefined && document.getElementById('temp-range')) { var minTempF = (data.minTemp * 9/5) + 32; var maxTempF = (data.maxTemp * 9/5) + 32; document.getElementById('temp-range').innerHTML = minTempF.toFixed(1) + '-' + maxTempF.toFixed(1) + '&deg;F'; }";
+  js += "if (data.systemCurrent !== undefined && document.getElementById('system-current')) document.getElementById('system-current').textContent = data.systemCurrent.toFixed(2) + 'A';";
+  js += "if (data.systemPower !== undefined && document.getElementById('system-power')) document.getElementById('system-power').textContent = data.systemPower.toFixed(0) + 'W';";
   js += "if (data.lastUpdate !== undefined && document.getElementById('last-update')) { var ago = Math.floor((Date.now() - Date.now()) / 1000); if (data.connected) { document.getElementById('last-update').textContent = 'Just now'; } else { document.getElementById('last-update').textContent = 'No data'; } }";
   js += "if (data.balancing !== undefined && document.getElementById('balance-status')) document.getElementById('balance-status').textContent = data.balancing ? 'Active' : 'Inactive';";
   js += "if (data.knownMessages !== undefined && document.getElementById('master-count')) document.getElementById('master-count').textContent = data.masterMessages;";
-  js += "if (data.current !== undefined && document.getElementById('master-current')) document.getElementById('master-current').textContent = data.current.toFixed(2) + 'A';";
-  js += "if (data.power !== undefined && document.getElementById('master-power')) document.getElementById('master-power').textContent = data.power.toFixed(0) + 'W';";
+  js += "if (data.systemCurrent !== undefined && document.getElementById('master-current')) document.getElementById('master-current').textContent = data.systemCurrent.toFixed(2) + 'A';";
+  js += "if (data.systemPower !== undefined && document.getElementById('master-power')) document.getElementById('master-power').textContent = data.systemPower.toFixed(0) + 'W';";
   js += "loadModules(true); loadMessages(true);";
   js += "} catch (error) { console.error('Update error:', error); }";
   js += "}";
@@ -1640,7 +1916,9 @@ String getMessagesJSON() {
   output.reserve(2048);
   serializeJson(doc, output);
 
-  Serial.printf("[DEBUG] Messages JSON length: %d, unknown: %d, known: %d\n", output.length(), unknownCount, knownCount);
+  String msgDebug = "[DEBUG] Messages JSON length: " + String(output.length()) + ", unknown: " + String(unknownCount) + ", known: " + String(knownCount);
+  Serial.println(msgDebug);
+  captureSerialOutput(msgDebug);
 
   return output;
 }
